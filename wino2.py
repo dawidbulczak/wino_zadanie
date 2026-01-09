@@ -1,5 +1,6 @@
 # wino2.py
-# Streamlit app do analizy jakości win i dopasowania do restauracji
+# Streamlit app – analiza jakości wina + dopasowanie do restauracji
+# Zawiera SHAP (Explainable AI)
 
 import streamlit as st
 import pandas as pd
@@ -7,9 +8,13 @@ import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
 import plotly.express as px
+import shap
+
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.model_selection import train_test_split
 
 # --------------------------------------------------
-# Konfiguracja strony
+# KONFIGURACJA STRONY
 # --------------------------------------------------
 st.set_page_config(
     page_title="Wine Analytics for Restaurants",
@@ -18,12 +23,16 @@ st.set_page_config(
 
 st.title("🍷 Wine Analytics for Restaurants")
 st.markdown(
-    "Aplikacja wspierająca **sprzedaż i dobór win** do restauracji na podstawie "
-    "jakości wina oraz dopasowania do typu kuchni i dań."
+    """
+    Aplikacja wspierająca **sprzedaż win do restauracji**:
+    - eksploracja jakości win,
+    - dopasowanie win do kuchni i dań,
+    - wsparcie decyzji: **gdzie najlepiej sprzedać dane wino z magazynu**.
+    """
 )
 
 # --------------------------------------------------
-# Wczytywanie danych
+# WCZYTYWANIE DANYCH
 # --------------------------------------------------
 @st.cache_data
 def load_data():
@@ -34,44 +43,42 @@ def load_data():
 wine_df, pairing_df = load_data()
 
 # --------------------------------------------------
-# Funkcja eksploracji danych (wspólna)
+# FUNKCJA EDA
 # --------------------------------------------------
 def basic_eda(df: pd.DataFrame):
     st.write("**Podgląd danych (head):**")
     st.dataframe(df.head())
 
     col1, col2, col3 = st.columns(3)
-    with col1:
-        st.metric("Liczba wierszy", df.shape[0])
-    with col2:
-        st.metric("Liczba kolumn", df.shape[1])
-    with col3:
-        st.metric("Duplikaty", df.duplicated().sum())
+    col1.metric("Liczba wierszy", df.shape[0])
+    col2.metric("Liczba kolumn", df.shape[1])
+    col3.metric("Duplikaty", df.duplicated().sum())
 
     st.write("**Typy danych:**")
-    st.dataframe(df.dtypes.astype(str), use_container_width=True)
+    st.dataframe(df.dtypes.astype(str))
 
     st.write("**Brakujące wartości:**")
     na = df.isna().sum()
     st.dataframe(na[na > 0] if na.sum() > 0 else pd.DataFrame({"Braki": [0]}))
 
 # --------------------------------------------------
-# Sidebar
+# SIDEBAR
 # --------------------------------------------------
 module = st.sidebar.radio(
-    "Wybierz sekcję",
+    "Wybierz sekcję:",
     [
         "Wine Quality – eksploracja",
-        "Wine Quality – rozkłady i porównania",
-        "Food Pairings – eksploracja i filtracja"
+        "Wine Quality – rozkłady, porównania i SHAP",
+        "Food Pairings – restauracje i sprzedaż"
     ]
 )
 
 # ==================================================
-# 1. WINE QUALITY – EDA + FILTROWANIE
+# 1️⃣ WINE QUALITY – EKSPLORACJA + FILTRY
 # ==================================================
 if module == "Wine Quality – eksploracja":
-    st.header("📊 Wine Quality – podstawowa eksploracja")
+
+    st.header("📊 Wine Quality – podstawowa eksploracja danych")
     basic_eda(wine_df)
 
     st.subheader("🔎 Filtrowanie i szybkie wnioski")
@@ -80,19 +87,16 @@ if module == "Wine Quality – eksploracja":
     q_range = st.slider("Zakres quality", q_min, q_max, (q_min, q_max))
 
     feature = st.selectbox(
-        "Dodatkowa cecha do filtrowania",
+        "Dodatkowa cecha",
         [c for c in wine_df.columns if c != "quality"]
     )
 
     f_min, f_max = float(wine_df[feature].min()), float(wine_df[feature].max())
-    f_range = st.slider(
-        f"Zakres {feature}",
-        f_min, f_max, (f_min, f_max)
-    )
+    f_range = st.slider(f"Zakres {feature}", f_min, f_max, (f_min, f_max))
 
     filt = wine_df[
-        (wine_df.quality.between(*q_range)) &
-        (wine_df[feature].between(*f_range))
+        wine_df.quality.between(*q_range) &
+        wine_df[feature].between(*f_range)
     ]
 
     st.write(f"Pozostało rekordów: **{len(filt)}**")
@@ -102,10 +106,11 @@ if module == "Wine Quality – eksploracja":
     st.write(filt[[feature, "quality"]].agg(["mean", "median", "min", "max"]))
 
 # ==================================================
-# 2. ROZKŁADY, PORÓWNANIA + 3D
+# 2️⃣ ROZKŁADY + PORÓWNANIA + 3D + SHAP
 # ==================================================
-elif module == "Wine Quality – rozkłady i porównania":
-    st.header("📈 Rozkłady i porównania cech jakości")
+elif module == "Wine Quality – rozkłady, porównania i SHAP":
+
+    st.header("📈 Rozkłady i porównania jakości wina")
 
     feature = st.selectbox(
         "Wybierz cechę",
@@ -113,16 +118,17 @@ elif module == "Wine Quality – rozkłady i porównania":
     )
 
     col1, col2 = st.columns(2)
+
     with col1:
         fig, ax = plt.subplots()
         sns.histplot(wine_df[feature], bins=30, ax=ax)
-        ax.set_title(f"Histogram: {feature}")
+        ax.set_title(f"Histogram – {feature}")
         st.pyplot(fig)
 
     with col2:
         fig, ax = plt.subplots()
         sns.boxplot(x=wine_df[feature], ax=ax)
-        ax.set_title(f"Boxplot: {feature}")
+        ax.set_title(f"Boxplot – {feature}")
         st.pyplot(fig)
 
     st.subheader("⚖️ Porównanie grup jakości")
@@ -133,23 +139,24 @@ elif module == "Wine Quality – rozkłady i porównania":
     )
 
     if mode == "quality ≤ X vs > X":
-        x = st.slider("X", int(wine_df.quality.min()), int(wine_df.quality.max()), 5)
-        g1 = wine_df[wine_df.quality <= x]
-        g2 = wine_df[wine_df.quality > x]
+        x = st.slider("X", int(wine_df.quality.min()), int(wine_df.quality.max()), 6)
+        g1 = wine_df[wine_df.quality <= x][feature]
+        g2 = wine_df[wine_df.quality > x][feature]
         labels = [f"≤ {x}", f"> {x}"]
     else:
         q_vals = sorted(wine_df.quality.unique())
         a, b = st.selectbox("A", q_vals), st.selectbox("B", q_vals, index=1)
-        g1 = wine_df[wine_df.quality == a]
-        g2 = wine_df[wine_df.quality == b]
+        g1 = wine_df[wine_df.quality == a][feature]
+        g2 = wine_df[wine_df.quality == b][feature]
         labels = [str(a), str(b)]
 
     fig, ax = plt.subplots()
-    ax.boxplot([g1[feature], g2[feature]], labels=labels)
+    ax.boxplot([g1, g2], labels=labels)
     ax.set_title(f"{feature} vs quality")
     st.pyplot(fig)
 
-    st.subheader("🧊 Wykres 3D (sprzedażowy insight)")
+    st.subheader("🌐 Wykres 3D – profil chemiczny wina")
+
     fig3d = px.scatter_3d(
         wine_df,
         x="alcohol",
@@ -160,14 +167,46 @@ elif module == "Wine Quality – rozkłady i porównania":
     )
     st.plotly_chart(fig3d, use_container_width=True)
 
+    # ---------------- SHAP ----------------
+    st.subheader("🤖 Wyjaśnienie modelu jakości (SHAP)")
+
+    X = wine_df.drop("quality", axis=1)
+    y = wine_df["quality"]
+
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.2, random_state=42
+    )
+
+    model = RandomForestRegressor(
+        n_estimators=100,
+        random_state=42
+    )
+    model.fit(X_train, y_train)
+
+    explainer = shap.Explainer(model, X_train)
+    shap_values = explainer(X_test)
+
+    st.markdown(
+        """
+        **Interpretacja:**
+        SHAP pokazuje, które cechy chemiczne wina
+        najbardziej wpływają na ocenę jakości.
+        """
+    )
+
+    fig, ax = plt.subplots()
+    shap.plots.bar(shap_values, show=False)
+    st.pyplot(fig)
+
 # ==================================================
-# 3. FOOD PAIRINGS – RESTAURACJE
+# 3️⃣ FOOD PAIRINGS – RESTAURACJE + SPRZEDAŻ
 # ==================================================
-elif module == "Food Pairings – eksploracja i filtracja":
-    st.header("🍽️ Food Pairings – dobór win do restauracji")
+else:
+
+    st.header("🍽️ Food Pairings – sprzedaż win do restauracji")
     basic_eda(pairing_df)
 
-    st.subheader("🔎 Filtrowanie pod klienta (restaurację)")
+    st.subheader("🔎 Filtrowanie pod restaurację")
 
     c1, c2, c3, c4 = st.columns(4)
     with c1:
@@ -193,14 +232,45 @@ elif module == "Food Pairings – eksploracja i filtracja":
     st.write(f"Pozostało dopasowań: **{len(filt)}**")
     st.dataframe(filt)
 
-    st.write("**Statystyki jakości dopasowań:**")
-    st.write(
-        filt[["pairing_quality"]]
-        .agg(["mean", "median", "min", "max"])
+    st.write("**Statystyki dopasowań:**")
+    st.write(filt[["pairing_quality"]].agg(["mean", "median", "min", "max"]))
+
+    # ---------------- SPRZEDAŻ MAGAZYNOWA ----------------
+    st.subheader("📦 Gdzie najlepiej sprzedać dane wino?")
+
+    selected_wine = st.selectbox(
+        "Wino zalegające w magazynie",
+        sorted(pairing_df.wine_type.unique())
     )
 
+    wine_focus = pairing_df[pairing_df.wine_type == selected_wine]
+
+    sales = (
+        wine_focus
+        .groupby("cuisine")
+        .agg(
+            avg_quality=("pairing_quality", "mean"),
+            count=("pairing_quality", "count")
+        )
+        .reset_index()
+    )
+
+    sales["sales_score"] = sales["avg_quality"] * sales["count"]
+
+    fig = px.bar(
+        sales.sort_values("sales_score", ascending=False),
+        x="cuisine",
+        y="sales_score",
+        title=f"Potencjał sprzedaży wina: {selected_wine}",
+        labels={
+            "cuisine": "Profil restauracji",
+            "sales_score": "Potencjał sprzedaży"
+        }
+    )
+
+    st.plotly_chart(fig, use_container_width=True)
+
     st.success(
-        "🎯 **Zastosowanie biznesowe:**\n"
-        "Na podstawie filtrów możesz przygotować **spersonalizowaną ofertę win** "
-        "dla konkretnej restauracji, kuchni lub typu dań."
+        "🎯 **Wniosek biznesowy:** "
+        "Wino warto kierować do restauracji, gdzie ma najwyższy potencjał sprzedaży."
     )
